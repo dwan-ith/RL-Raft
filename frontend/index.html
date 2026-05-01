@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RL-Raft</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+  <header>
+    <div>
+      <h1>RL-Raft</h1>
+      <div id="subtitle">Waiting for cluster...</div>
+    </div>
+    <button onclick="sendCommand({action:'client_command', value:'doc-update-' + Date.now()})">Append Log Entry</button>
+  </header>
+  <main>
+    <div class="controls left-panel">
+      <section>
+        <h2>Nodes</h2>
+        <div id="nodes" class="nodes"></div>
+      </section>
+      <section>
+        <h2>Recent Events</h2>
+        <div id="events" class="events"></div>
+      </section>
+    </div>
+    <div class="controls right-panel">
+      <section>
+        <h2>Context</h2>
+        <p style="margin:0;color:var(--muted);line-height:1.45;font-size:13px;">
+          This simulates a concurrent Raft environment using an RL meta-controller. Agents
+          dynamically learn network timeout policies under stress.
+        </p>
+      </section>
+      <section>
+        <h2>Metrics</h2>
+        <div id="metrics" class="metrics"></div>
+      </section>
+      <section>
+        <h2>Chaos Controls</h2>
+        <div class="controls">
+          <div class="row">
+            <label>Node<select id="nodeSelect"></select></label>
+            <button class="danger" onclick="nodeAction('crash')">Crash</button>
+            <button class="good" onclick="nodeAction('restart')">Restart</button>
+          </div>
+          <label>Base latency ms<input id="latency" type="number" min="0" value="30"></label>
+          <label>Jitter ms<input id="jitter" type="number" min="0" value="20"></label>
+          <label>Packet loss 0.0-1.0<input id="loss" type="number" min="0" max="1" step="0.05" value="0"></label>
+          <button onclick="updateNetwork()">Apply Network</button>
+          <div class="row">
+            <button class="secondary" onclick="majorityPartition()">Partition 3 | 2</button>
+            <button class="secondary" onclick="sendCommand({action:'heal'})">Heal</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+  <script src="app.js"></script>
+</body>
+
+</html>

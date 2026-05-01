@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+node_data/
+runs/simulations/
+runs/policies/
+.env
+venv/
+.venv/
+*.webp
+*.log
