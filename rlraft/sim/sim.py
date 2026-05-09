@@ -181,9 +181,7 @@ class TabularQTimeoutPolicy:
     def timeout_ms(self, observation: NodeObservation, rng: random.Random) -> float:
         action = self.choose_action(observation)
         low, high = self.arms[action]
-        span = high - low
-        quality_offset = min(observation_quality_score(observation), 1.0) * 1250.0
-        return min(high, rng.uniform(low, low + span * 0.15) + quality_offset)
+        return rng.uniform(float(low), float(high))
 
 
 def generate_conditions(

@@ -1,0 +1,4 @@
+policy,nodes,episodes,success_rate,split_vote_rate,best_node_win_rate,average_failover_ms,average_rounds,average_candidates_started
+static,50,1000,0.835,2.355,0.114,3522.084428009693,3.19,38.465
+dynatune_like,50,1000,1.0,0.131,0.433,517.6064732772737,1.131,2.453
+learned,50,1000,1.0,0.117,0.797,603.8724862846783,1.117,2.048

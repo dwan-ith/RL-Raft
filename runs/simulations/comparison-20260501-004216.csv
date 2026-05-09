@@ -1,0 +1,3 @@
+cluster_size,current_term,elections_started,last_election_duration_s,last_failover_time_s,leader_id,leader_stability_s,leaders_elected,messages_delivered,messages_dropped,messages_seen,policy_mode,repetition,snapshot_path,split_votes,started_at
+5,2,2,0.12023162841796875,0.43341588973999023,0,3.512918472290039,2,243,0,247,static,1,runs\static-20260501-004210.json,0,1777576325.2000542
+5,4,10,0.10846829414367676,0.7375216484069824,3,3.5154354572296143,2,310,0,313,adaptive,1,runs\adaptive-20260501-004216.json,3,1777576330.612972

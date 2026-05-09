@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import random
 
-from .llm_advisor import AdvisorGuidance, get_default_guidance, guidance_to_dict
+from .guidance import AdvisorGuidance, get_guidance, guidance_to_dict
 from rlraft.sim.sim import (
     FEATURE_NAMES,
     TIMEOUT_ARMS,
@@ -40,7 +40,7 @@ def train_policy(
     output_path: str = "runs/learned_policy.json",
     seed: int = 7,
     learning_rate: float = 0.16,
-    advisor: str = "llm",
+    advisor: str = "off",
     advisor_interval: int = 5000,
     require_llm: bool = False,
 ) -> TrainingResult:
@@ -62,21 +62,18 @@ def train_policy(
         bucket: {arm: 0 for arm in arms}
         for bucket in BUCKETS
     }
-    guidance = get_default_guidance(advisor=advisor)
-    if require_llm and guidance.source != "llm":
-        raise RuntimeError(f"LLM advisor required but unavailable: {guidance.notes}")
+    if require_llm:
+        raise RuntimeError("LLM reward-shaping advisors are disabled; use llm_mappo.")
+    guidance = get_guidance(advisor=advisor)
     advisor_history = [guidance_to_dict(guidance)]
     rolling = _RollingMetrics()
 
     for episode in range(episodes):
         if episode > 0 and advisor_interval > 0 and episode % advisor_interval == 0:
-            guidance = get_default_guidance(
-                metrics=rolling.metrics(),
-                greedy_policy=_greedy_policy(q_values),
+            guidance = get_guidance(
                 advisor=advisor,
+                metrics=rolling.metrics(),
             )
-            if require_llm and guidance.source != "llm":
-                raise RuntimeError(f"LLM advisor required but unavailable: {guidance.notes}")
             advisor_history.append({"episode": episode, **guidance_to_dict(guidance)})
             rolling = _RollingMetrics()
 
@@ -127,7 +124,7 @@ def train_policy(
         "greedy_policy": {
             **_greedy_policy(q_values)
         },
-        "advisor_default": "llm",
+        "advisor_default": "off",
         "advisor_history": advisor_history,
         "evaluation_metrics": eval_metrics,
         "research_note": (

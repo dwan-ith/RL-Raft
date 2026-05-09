@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 
@@ -9,6 +10,8 @@ from rlraft.web.dashboard import DashboardServer
 from rlraft.sim.experiments import run_policy_comparison, run_simulation_comparison
 from rlraft.core.supervisor import ClusterSupervisor
 from rlraft.rl.training import train_policy
+from rlraft.rl.mappo import train_mappo_policy
+from rlraft.rl.llm_node import check_llm_node_policy
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     start = sub.add_parser("start", help="start a live cluster and dashboard")
     start.add_argument("--config", help="path to JSON config")
     start.add_argument("--nodes", type=int, default=None, help="cluster size")
-    start.add_argument("--policy", choices=["static", "adaptive", "learned", "rl_stub"], default=None)
+    start.add_argument("--policy", choices=["static", "adaptive", "learned", "mappo", "llm", "rl_stub"], default=None)
     start.add_argument("--host", default=None)
     start.add_argument("--port", type=int, default=None)
     start.add_argument("--no-dashboard", action="store_true")
@@ -34,23 +37,29 @@ def build_parser() -> argparse.ArgumentParser:
     sim.add_argument("--episodes", type=int, default=1000)
     sim.add_argument("--output-dir", default="runs")
     sim.add_argument("--seed", type=int, default=7)
+    sim.add_argument("--include-llm", action="store_true", help="include direct LLM-node policy with deterministic fallback")
+    sim.add_argument("--train-episodes", type=int, default=12000, help="MAPPO episodes if a comparison policy must be trained")
 
     train = sub.add_parser("train", help="run multi-agent practice rounds")
     train.add_argument("--episodes", type=int, default=6000)
     train.add_argument("--nodes", type=int, default=50)
-    train.add_argument("--output", default="runs/policies/learned_policy.json")
-    train.add_argument("--advisor", choices=["llm", "deterministic", "off"], default="llm")
+    train.add_argument("--output", default="runs/policies/learned_ppo.json")
+    train.add_argument("--algorithm", choices=["llm_mappo", "mappo", "qlearning"], default="llm_mappo")
+    train.add_argument("--advisor", choices=["deterministic", "off"], default="off", help="legacy qlearning only; LLM reward shaping is disabled")
     train.add_argument("--advisor-interval", type=int, default=5000)
+    train.add_argument("--require-llm", action="store_true", help="fail unless direct LLM-node policy can make a decision")
 
     smoke = sub.add_parser("smoke", help="start a cluster briefly and print final metrics")
     smoke.add_argument("--nodes", type=int, default=50)
-    smoke.add_argument("--policy", choices=["static", "adaptive", "learned", "rl_stub"], default="learned")
+    smoke.add_argument("--policy", choices=["static", "adaptive", "learned", "mappo", "llm", "rl_stub"], default="llm")
     smoke.add_argument("--seconds", type=float, default=5.0)
     smoke.add_argument("--train-episodes", type=int, default=6000)
     smoke.add_argument("--snapshot", default=None)
 
     cfg = sub.add_parser("write-config", help="write a default config file")
     cfg.add_argument("path", nargs="?", default="config.json")
+
+    sub.add_parser("check-llm", help="check direct LLM-node policy access without printing secrets")
     return parser
 
 
@@ -70,34 +79,53 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "sim-compare":
         from pathlib import Path
-        output_dir = Path("runs/simulations")
+        output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = run_simulation_comparison(
             nodes=args.nodes,
             episodes=args.episodes,
             output_dir=str(output_dir),
             seed=args.seed,
+            include_llm=args.include_llm,
+            train_episodes=args.train_episodes,
         )
         print(f"Wrote deterministic simulation comparison to {csv_path}")
         return 0
     if args.command == "train":
         from pathlib import Path
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        result = train_policy(
-            args.episodes,
-            args.nodes,
-            args.output,
-            advisor=args.advisor,
-            advisor_interval=args.advisor_interval,
-        )
+        if args.require_llm:
+            llm_status = check_llm_node_policy()
+            if llm_status["source"] not in {"llm", "llm_cache"}:
+                print(json.dumps(llm_status, indent=2))
+                return 1
+        if args.algorithm in {"llm_mappo", "mappo"}:
+            result = train_mappo_policy(
+                episodes=args.episodes,
+                nodes=args.nodes,
+                output_path=args.output,
+                use_llm_prior=args.algorithm == "llm_mappo",
+                require_llm=args.require_llm,
+            )
+        else:
+            result = train_policy(
+                args.episodes,
+                args.nodes,
+                args.output,
+                advisor=args.advisor,
+                advisor_interval=args.advisor_interval,
+            )
         print(
-            "Trained learned timeout policy: "
+            f"Trained {args.algorithm} timeout policy: "
             f"success={result.success_rate:.3f} "
             f"split={result.split_vote_rate:.3f} "
             f"best_node_wins={result.best_node_win_rate:.3f} "
             f"avg_failover={result.average_failover_ms:.1f}ms "
             f"path={result.policy_path}"
         )
+        return 0
+    if args.command == "check-llm":
+        print(json.dumps(check_llm_node_policy(), indent=2))
         return 0
     if args.command == "smoke":
         return smoke_cluster(args)
@@ -116,16 +144,15 @@ def start_cluster(args: argparse.Namespace) -> int:
         config.dashboard_host = args.host
     if args.port is not None:
         config.dashboard_port = args.port
-    if config.policy_mode == "learned":
+    if config.policy_mode in {"learned", "mappo"}:
         from pathlib import Path
 
         if not Path(config.learned_policy_path).exists():
-            result = train_policy(
+            result = train_mappo_policy(
                 episodes=args.train_episodes,
                 nodes=config.cluster_size,
                 output_path=config.learned_policy_path,
                 seed=config.random_seed,
-                advisor="llm",
             )
             print(
                 "Trained learned timeout policy before launch: "
@@ -167,16 +194,15 @@ def start_cluster(args: argparse.Namespace) -> int:
 
 def smoke_cluster(args: argparse.Namespace) -> int:
     config = ClusterConfig(cluster_size=args.nodes, policy_mode=args.policy)
-    if config.policy_mode == "learned":
+    if config.policy_mode in {"learned", "mappo"}:
         from pathlib import Path
 
         if not Path(config.learned_policy_path).exists():
-            train_policy(
+            train_mappo_policy(
                 episodes=args.train_episodes,
                 nodes=config.cluster_size,
                 output_path=config.learned_policy_path,
                 seed=config.random_seed,
-                advisor="llm",
             )
     supervisor = ClusterSupervisor(config)
     supervisor.start()

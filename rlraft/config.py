@@ -17,8 +17,8 @@ class NetworkConfig:
 @dataclass(slots=True)
 class ClusterConfig:
     cluster_size: int = 50
-    policy_mode: str = "learned"
-    learned_policy_path: str = "runs/policies/learned_policy.json"
+    policy_mode: str = "llm"
+    learned_policy_path: str = "runs/policies/learned_ppo.json"
     heartbeat_interval: float = 0.12
     tick_interval: float = 0.02
     election_timeout_min: float = 0.35

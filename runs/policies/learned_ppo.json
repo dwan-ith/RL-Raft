@@ -1,0 +1,4 @@
+{
+  "policy_type": "ppo_timeout_policy",
+  "model_path": "runs/policies/learned_policy.zip"
+}

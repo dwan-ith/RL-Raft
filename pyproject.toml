@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlraft"
+version = "0.1.0"
+authors = [
+  { name="dwan-ith" },
+]
+description = "Multi-Agent Reinforcement Learning for Raft Consensus Timeout Optimization"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0.0",
+    "numpy",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/dwan-ith/RL-Raft"
+
+[project.scripts]
+rlraft = "rlraft.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rlraft*"]

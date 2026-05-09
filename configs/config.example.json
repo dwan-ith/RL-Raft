@@ -1,7 +1,7 @@
 {
   "cluster_size": 50,
-  "policy_mode": "learned",
-  "learned_policy_path": "runs/learned_policy.json",
+  "policy_mode": "llm",
+  "learned_policy_path": "runs/policies/llm_mappo_policy.json",
   "heartbeat_interval": 0.12,
   "tick_interval": 0.02,
   "election_timeout_min": 0.35,

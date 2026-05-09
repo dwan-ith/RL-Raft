@@ -5,13 +5,17 @@ import json
 import math
 from pathlib import Path
 import random
+import threading
 
 from rlraft.config import ClusterConfig
 from rlraft.sim.sim import observation_bucket as sim_observation_bucket
-from rlraft.sim.sim import observation_quality_score
 from rlraft.sim.sim import NodeObservation
+from rlraft.rl.llm_node import LLMNodePolicyClient
+from rlraft.rl.mappo import MAPPOTimeoutPolicy
 
 _PPO_MODELS = {}
+_MAPPO_POLICIES = {}
+_POLICY_LOCK = threading.Lock()
 
 
 
@@ -39,6 +43,7 @@ class ElectionPolicy:
         self.node_id = node_id
         self.rng = random.Random(config.random_seed + node_id * 997)
         self.learned_policy = self._load_learned_policy()
+        self.llm_client = LLMNodePolicyClient(require_llm=False) if mode == "llm" else None
 
     def next_timeout(self, observation: Observation) -> float:
         if self.mode == "static":
@@ -48,7 +53,9 @@ class ElectionPolicy:
             )
         if self.mode in {"adaptive", "rl_stub"}:
             return self._adaptive_timeout(observation)
-        if self.mode == "learned":
+        if self.mode == "llm":
+            return self._llm_timeout(observation)
+        if self.mode in {"learned", "mappo"}:
             return self._learned_timeout(observation)
         raise ValueError(f"unknown policy mode: {self.mode}")
 
@@ -79,6 +86,8 @@ class ElectionPolicy:
             return self._linear_timeout(observation)
         if self.learned_policy.get("policy_type") == "tabular_marl_timeout_q_policy":
             return self._tabular_marl_timeout(observation)
+        if self.learned_policy.get("policy_type") == "mappo_timeout_policy":
+            return self._mappo_timeout(observation)
         if self.learned_policy.get("policy_type") == "ppo_timeout_policy":
             return self._ppo_timeout(observation)
 
@@ -144,12 +153,38 @@ class ElectionPolicy:
         values = q_values.get(bucket) or q_values.get("default")
         action = max(values, key=values.get)
         low, high = self.learned_policy["arms"][action]
-        low = float(low)
-        high = float(high)
-        span = high - low
-        quality_offset = min(observation_quality_score(sim_obs), 1.0) * 1250.0
-        timeout_ms = min(high, self.rng.uniform(low, low + span * 0.15) + quality_offset)
-        return timeout_ms / 1000.0
+        return self.rng.uniform(float(low), float(high)) / 1000.0
+
+    def _mappo_timeout(self, observation: Observation) -> float:
+        path = str(Path(self.config.learned_policy_path))
+        if path not in _MAPPO_POLICIES:
+            with _POLICY_LOCK:
+                if path not in _MAPPO_POLICIES:
+                    _MAPPO_POLICIES[path] = MAPPOTimeoutPolicy.from_artifact(path)
+        sim_obs = NodeObservation(
+            node_id=observation.node_id,
+            mean_rtt_ms=observation.estimated_rtt_ms,
+            loss_rate=0.0,
+            log_gap=observation.log_gap,
+            recent_split=observation.recent_split_vote,
+        )
+        return _MAPPO_POLICIES[path].timeout_ms(sim_obs, self.rng) / 1000.0
+
+    def _llm_timeout(self, observation: Observation) -> float:
+        if self.llm_client is None:
+            return self._adaptive_timeout(observation)
+        decision = self.llm_client.decide(
+            {
+                "node_id": observation.node_id,
+                "estimated_rtt_ms": observation.estimated_rtt_ms,
+                "loss_rate": 0.0,
+                "log_gap": observation.log_gap,
+                "recent_split_vote": observation.recent_split_vote,
+                "recent_election_lost": observation.recent_election_lost,
+            },
+            self.rng,
+        )
+        return decision.timeout_ms / 1000.0
 
     def _ppo_timeout(self, observation: Observation) -> float:
         import numpy as np
@@ -161,7 +196,9 @@ class ElectionPolicy:
             
         # Cache the model to avoid reloading on every timeout
         if model_path not in _PPO_MODELS:
-            _PPO_MODELS[model_path] = PPO.load(model_path, device="cpu")
+            with _POLICY_LOCK:
+                if model_path not in _PPO_MODELS:
+                    _PPO_MODELS[model_path] = PPO.load(model_path, device="cpu")
         model = _PPO_MODELS[model_path]
         
         features = [
@@ -179,7 +216,7 @@ class ElectionPolicy:
 
 
     def _load_learned_policy(self) -> dict | None:
-        if self.mode != "learned":
+        if self.mode not in {"learned", "mappo"}:
             return None
         path = Path(self.config.learned_policy_path)
         if not path.exists():

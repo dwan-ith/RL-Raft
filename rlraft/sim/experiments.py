@@ -10,6 +10,8 @@ from rlraft.config import ClusterConfig
 from rlraft.core.supervisor import ClusterSupervisor
 from rlraft.sim.sim import DynatuneLikePolicy, StaticRandomPolicy, generate_conditions, simulate_failover
 from rlraft.rl.training import load_learned_policy, train_policy
+from rlraft.rl.llm_node import LLMNodeTimeoutPolicy
+from rlraft.rl.mappo import MAPPOTimeoutPolicy, train_mappo_policy
 
 
 def run_failover_experiment(
@@ -79,16 +81,29 @@ def run_simulation_comparison(
     episodes: int = 1000,
     output_dir: str = "runs",
     seed: int = 7,
+    include_llm: bool = False,
+    train_episodes: int = 12000,
 ) -> Path:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    learned_path = Path(output_dir) / "learned_policy.json"
-    if not learned_path.exists():
-        train_policy(episodes=12000, nodes=nodes, output_path=str(learned_path), seed=seed)
+    mappo_path = Path(output_dir) / "llm_mappo_policy.json"
+    if not mappo_path.exists():
+        train_mappo_policy(
+            episodes=train_episodes,
+            nodes=nodes,
+            output_path=str(mappo_path),
+            seed=seed,
+            use_llm_prior=True,
+        )
     policies = {
         "static": StaticRandomPolicy(),
         "dynatune_like": DynatuneLikePolicy(),
-        "learned": load_learned_policy(str(learned_path)),
+        "llm_mappo": MAPPOTimeoutPolicy.from_artifact(str(mappo_path)),
     }
+    q_path = Path(output_dir) / "learned_policy.json"
+    if q_path.exists():
+        policies["qlearning"] = load_learned_policy(str(q_path))
+    if include_llm:
+        policies["llm_nodes"] = LLMNodeTimeoutPolicy(require_llm=False)
     rows: list[dict[str, Any]] = []
     for name, policy in policies.items():
         successes = splits = best_wins = 0
