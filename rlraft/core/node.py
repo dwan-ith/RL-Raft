@@ -186,12 +186,20 @@ class RaftNode:
             local_last_term=self._last_log_term(),
         )
         granted = (not heartbeat_fresh) and message["term"] >= self.current_term and log_ok.granted
+        reason = "granted" if granted else ("leader_alive" if heartbeat_fresh else ("stale_term" if message["term"] < self.current_term else "stale_log"))
+        self._emit(
+            "pre_vote_decided",
+            term=message["term"],
+            candidate_id=message["src"],
+            granted=granted,
+            reason=reason,
+        )
         self._send(
             message["src"],
             PRE_VOTE_RESPONSE,
             term=self.current_term,
             vote_granted=granted,
-            reason="granted" if granted else "leader_alive_or_stale",
+            reason=reason,
             request_sent_at=message.get("sent_at"),
         )
 
@@ -230,6 +238,14 @@ class RaftNode:
             
         if decision.term > self.current_term or decision.granted:
             self._persist()
+
+        self._emit(
+            "vote_decided",
+            term=message["term"],
+            candidate_id=message["src"],
+            granted=decision.granted,
+            reason=decision.reason,
+        )
 
         self._send(
             message["src"],
