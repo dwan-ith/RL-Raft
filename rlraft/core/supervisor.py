@@ -63,6 +63,7 @@ class ClusterSupervisor:
         self._split_terms: set[int] = set()
         self._leader_since: float | None = None
         self._leader_crashed_at: float | None = None
+        self._election_history: dict[int, dict[str, Any]] = {}
 
     def start(self) -> None:
         if self.hub_thread is not None:
@@ -153,12 +154,17 @@ class ClusterSupervisor:
             now = time.time()
             if self._leader_since is not None and self.metrics.leader_id is not None:
                 self.metrics.leader_stability_s = now - self._leader_since
+                
+            sorted_history = sorted(self._election_history.values(), key=lambda e: e["term"], reverse=True)
+            latest_elections = sorted_history[:5]
+            
             return {
                 "config": self.config.to_dict(),
                 "nodes": {str(k): dict(v) for k, v in self.nodes.items()},
                 "network": dict(self.network),
                 "metrics": asdict(self.metrics),
                 "recent_events": list(self.recent_events[-80:]),
+                "election_history": latest_elections,
                 "processes": {
                     "hub_alive": bool(self.hub_thread and self.hub_thread.is_alive()),
                     "nodes_alive": [thread.is_alive() for thread in self.node_threads],
@@ -214,10 +220,94 @@ class ClusterSupervisor:
                     }
                 )
 
-            if event_name == "election_started":
+            if event_name == "pre_vote_started":
+                term = int(message["term"])
+                node_id = int(message["node_id"])
+                history = self._election_history.setdefault(term, {
+                    "term": term,
+                    "pre_candidates": [],
+                    "candidates": [],
+                    "pre_votes": {},
+                    "votes": {},
+                    "winner": None,
+                    "status": "ongoing",
+                    "start_time": time.time(),
+                    "end_time": None
+                })
+                if node_id not in history["pre_candidates"]:
+                    history["pre_candidates"].append(node_id)
+
+            elif event_name == "pre_vote_decided":
+                term = int(message["term"])
+                voter_id = int(message["node_id"])
+                candidate_id = int(message["candidate_id"])
+                granted = bool(message["granted"])
+                reason = str(message["reason"])
+                history = self._election_history.setdefault(term, {
+                    "term": term,
+                    "pre_candidates": [],
+                    "candidates": [],
+                    "pre_votes": {},
+                    "votes": {},
+                    "winner": None,
+                    "status": "ongoing",
+                    "start_time": time.time(),
+                    "end_time": None
+                })
+                history["pre_votes"].setdefault(str(candidate_id), {})[str(voter_id)] = {"granted": granted, "reason": reason}
+
+            elif event_name == "election_started":
                 self._record_election_started(message)
+                term = int(message["term"])
+                node_id = int(message["node_id"])
+                history = self._election_history.setdefault(term, {
+                    "term": term,
+                    "pre_candidates": [],
+                    "candidates": [],
+                    "pre_votes": {},
+                    "votes": {},
+                    "winner": None,
+                    "status": "ongoing",
+                    "start_time": time.time(),
+                    "end_time": None
+                })
+                if node_id not in history["candidates"]:
+                    history["candidates"].append(node_id)
+
+            elif event_name == "vote_decided":
+                term = int(message["term"])
+                voter_id = int(message["node_id"])
+                candidate_id = int(message["candidate_id"])
+                granted = bool(message["granted"])
+                reason = str(message["reason"])
+                history = self._election_history.setdefault(term, {
+                    "term": term,
+                    "pre_candidates": [],
+                    "candidates": [],
+                    "pre_votes": {},
+                    "votes": {},
+                    "winner": None,
+                    "status": "ongoing",
+                    "start_time": time.time(),
+                    "end_time": None
+                })
+                history["votes"].setdefault(str(candidate_id), {})[str(voter_id)] = {"granted": granted, "reason": reason}
+
             elif event_name == "leader_elected":
                 self._record_leader_elected(message)
+                term = int(message["term"])
+                winner = int(message["node_id"])
+                if term in self._election_history:
+                    self._election_history[term]["winner"] = winner
+                    self._election_history[term]["status"] = "success"
+                    self._election_history[term]["end_time"] = time.time()
+
+            elif event_name == "election_failed":
+                term = int(message["term"])
+                if term in self._election_history:
+                    self._election_history[term]["status"] = "failed"
+                    self._election_history[term]["end_time"] = time.time()
+
             elif event_name == "node_crashed":
                 self._record_node_crashed(message)
             elif event_name == "node_restarted":
