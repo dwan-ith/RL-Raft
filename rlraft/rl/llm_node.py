@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import json
 import os
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 import random
@@ -13,25 +15,80 @@ from rlraft.env import load_env
 from rlraft.sim.sim import TIMEOUT_ARMS, NodeObservation
 
 
+# ---------------------------------------------------------------------------
+# Module-level state (thread-safe via lock)
+# ---------------------------------------------------------------------------
+
 LAST_NODE_LLM_ERROR: str | None = None
 LAST_NODE_LLM_KEY_SOURCE: str | None = None
 
+_state_lock = threading.Lock()
+
+# Tracks which keys are rate-limited and when they reset (epoch seconds).
+# Key: env var name, Value: reset timestamp (0 = not rate-limited).
+_RATE_LIMITED_UNTIL: dict[str, float] = {}
+
+
+# ---------------------------------------------------------------------------
+# Provider definitions
+# ---------------------------------------------------------------------------
+
+# Priority order: Groq (faster, lower latency) then OpenRouter (broader model
+# access). Within each provider keys are tried in order 1 → 2 → 3.
+_KEY_ORDER = [
+    ("DEEPSEEK_API_KEY",     "deepseek"),
+    ("GROQ_API_KEY",         "groq"),
+    ("GROQ_API_KEY_2",       "groq"),
+    ("GROQ_API_KEY_3",       "groq"),
+    ("OPENROUTER_API_KEY",   "openrouter"),
+    ("OPENROUTER_API_KEY_2", "openrouter"),
+    ("OPENROUTER_API_KEY_3", "openrouter"),
+]
+
+_GROQ_ENDPOINT       = "https://api.groq.com/openai/v1/chat/completions"
+_OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+_DEEPSEEK_ENDPOINT   = "https://api.deepseek.com/chat/completions"
+
+# Model selection per provider (both support the OpenAI chat completions format)
+_GROQ_MODEL       = "llama-3.1-8b-instant"
+_OPENROUTER_MODEL = "meta-llama/llama-3.2-3b-instruct:free"
+_DEEPSEEK_MODEL   = "deepseek-chat"
+
+_SYSTEM_PROMPT = (
+    "You are one Raft consensus node choosing only your own election timeout. "
+    "Fast, reliable, fresh-log nodes should choose shorter timeouts so they "
+    "start elections before slow peers. Slow, lossy, stale-log, or split-prone "
+    "nodes must back off with longer timeouts. "
+    "Return ONLY a JSON object with exactly one field: 'action'."
+)
+
+
+# ---------------------------------------------------------------------------
+# Public dataclasses
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
 class LLMNodeDecision:
-    source: str
-    action: str
+    source: str        # "groq", "openrouter", "llm_cache", "deterministic_fallback"
+    action: str        # one of TIMEOUT_ARMS keys
     timeout_ms: float
     notes: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Public client classes
+# ---------------------------------------------------------------------------
+
 class LLMNodePolicyClient:
     """Direct LLM timeout policy for Raft nodes.
 
-    This is deliberately not a reward-shaping advisor. Each node gives the LLM
-    its local observation and receives a timeout arm. Decisions are cached by
-    observation bucket so 50-node experiments do not spend one API call per
-    election timer reset.
+    Tries all 6 API keys (Groq first, then OpenRouter) in order. When a key
+    returns HTTP 429 (rate limited) it is skipped and the next is tried. Keys
+    are re-enabled after their Retry-After window expires. If all keys are
+    exhausted the client falls back to a deterministic heuristic.
+
+    Decisions are cached by observation bucket so large experiments do not
+    spend one API call per election timer reset.
     """
 
     def __init__(self, require_llm: bool = False):
@@ -54,24 +111,43 @@ class LLMNodePolicyClient:
 
     def decide(self, observation: dict[str, Any], rng: random.Random) -> LLMNodeDecision:
         key = _observation_key(observation)
-        action = self.cache.get(key)
-        source = "llm_cache" if action else "llm"
-        if action is None:
-            action = _request_llm_action(observation)
-            if action is not None:
-                self.cache[key] = action
-        if action is None:
-            if self.require_llm:
-                raise RuntimeError(f"LLM node policy required but unavailable: {LAST_NODE_LLM_ERROR}")
-            action = _fallback_action(observation)
-            source = "deterministic_fallback"
+        cached_action = self.cache.get(key)
+        if cached_action is not None:
+            low, high = TIMEOUT_ARMS[cached_action]
+            return LLMNodeDecision(
+                source="llm_cache",
+                action=cached_action,
+                timeout_ms=rng.uniform(float(low), float(high)),
+                notes="cached_by_observation_bucket",
+            )
 
+        result = _request_llm_action(observation)
+        if result is not None:
+            action, source = result
+            self.cache[key] = action
+            low, high = TIMEOUT_ARMS[action]
+            return LLMNodeDecision(
+                source=source,
+                action=action,
+                timeout_ms=rng.uniform(float(low), float(high)),
+                notes="live_llm_decision",
+            )
+
+        # All keys exhausted or unavailable
+        if self.require_llm:
+            with _state_lock:
+                err = LAST_NODE_LLM_ERROR
+            raise RuntimeError(
+                f"LLM node policy required but unavailable: {err}"
+            )
+
+        action = _fallback_action(observation)
         low, high = TIMEOUT_ARMS[action]
         return LLMNodeDecision(
-            source=source,
+            source="deterministic_fallback",
             action=action,
             timeout_ms=rng.uniform(float(low), float(high)),
-            notes="direct_node_timeout_decision",
+            notes="all_keys_exhausted_or_rate_limited",
         )
 
 
@@ -82,6 +158,10 @@ class LLMNodeTimeoutPolicy:
     def timeout_ms(self, observation: NodeObservation, rng: random.Random) -> float:
         return self.client.decide_from_sim_observation(observation, rng).timeout_ms
 
+
+# ---------------------------------------------------------------------------
+# Diagnostic helper
+# ---------------------------------------------------------------------------
 
 def check_llm_node_policy() -> dict[str, Any]:
     rng = random.Random(1)
@@ -96,86 +176,243 @@ def check_llm_node_policy() -> dict[str, Any]:
         },
         rng,
     )
+    with _state_lock:
+        key_source = LAST_NODE_LLM_KEY_SOURCE
+        llm_error = LAST_NODE_LLM_ERROR
     return {
         "source": decision.source,
         "action": decision.action,
         "timeout_ms": decision.timeout_ms,
-        "openai_key_source": LAST_NODE_LLM_KEY_SOURCE,
-        "llm_error": LAST_NODE_LLM_ERROR,
+        "llm_key_source": key_source,
+        "llm_error": llm_error,
+        "rate_limited_keys": [
+            k for k, t in _RATE_LIMITED_UNTIL.items() if t > time.time()
+        ],
     }
 
 
-def _request_llm_action(observation: dict[str, Any]) -> str | None:
+# ---------------------------------------------------------------------------
+# Core multi-provider request logic
+# ---------------------------------------------------------------------------
+
+def _request_llm_action(observation: dict[str, Any]) -> tuple[str, str] | None:
+    """Try each of the 6 API keys in priority order.
+
+    Returns (action, source_label) on success, or None if all keys fail.
+    On rate limit (429) the key is skipped. On auth error (401/403) the key
+    is also skipped. On network errors the remaining keys are still tried.
+    """
     global LAST_NODE_LLM_ERROR, LAST_NODE_LLM_KEY_SOURCE
-    LAST_NODE_LLM_ERROR = None
-    LAST_NODE_LLM_KEY_SOURCE = None
     load_env()
-    api_keys = [
-        ("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY")),
-        ("OPENAI_API_KEY_2", os.environ.get("OPENAI_API_KEY_2")),
-    ]
-    api_keys = [(name, value) for name, value in api_keys if value]
-    if not api_keys:
-        LAST_NODE_LLM_ERROR = "missing_api_key"
+
+    available_keys = _available_keys()
+    if not available_keys:
+        with _state_lock:
+            LAST_NODE_LLM_ERROR = "all_keys_missing_or_rate_limited"
         return None
 
-    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-    body = {
-        "model": model,
-        "store": False,
-        "temperature": 0.0,
-        "instructions": (
-            "You are one Raft node choosing only your own election timeout. "
-            "Fast, reliable, fresh-log nodes should choose shorter timeouts. "
-            "Slow, lossy, stale-log, or split-prone nodes should back off. "
-            "Return only JSON with an action field."
-        ),
-        "input": json.dumps(
-            {
-                "local_observation": observation,
-                "valid_actions": list(TIMEOUT_ARMS),
-                "schema": {"action": "one of valid_actions", "notes": "short string"},
-            },
-            indent=2,
-        ),
-    }
     errors: list[str] = []
-    for key_name, api_key in api_keys:
-        request = urllib.request.Request(
-            "https://api.openai.com/v1/responses",
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            text = _extract_response_text(payload)
-            parsed = json.loads(_extract_json_object(text))
-            action = str(parsed.get("action", "")).strip()
-            if action in TIMEOUT_ARMS:
-                LAST_NODE_LLM_KEY_SOURCE = key_name
-                return action
-            errors.append(f"{key_name}:invalid_action:{action}")
-        except urllib.error.HTTPError as exc:
-            errors.append(f"{key_name}:http_{exc.code}:{_safe_error_body(exc)}")
-            if exc.code not in {401, 403, 429}:
-                break
-        except (urllib.error.URLError, TimeoutError) as exc:
-            errors.append(f"{key_name}:network_error:{exc}")
-            break
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            errors.append(f"{key_name}:invalid_response:{exc}")
-            break
+    now = time.time()
 
-    LAST_NODE_LLM_ERROR = " | ".join(errors) if errors else "unknown_api_failure"
+    for key_name, provider, api_key in available_keys:
+        # Double-check rate limit window hasn't expired since we built the list
+        with _state_lock:
+            reset_at = _RATE_LIMITED_UNTIL.get(key_name, 0.0)
+        if reset_at > now:
+            errors.append(f"{key_name}:still_rate_limited_until_{int(reset_at)}")
+            continue
+
+        result = _call_provider(key_name, provider, api_key, observation)
+        if result is None:
+            # Error was recorded inside _call_provider; check _last_error
+            with _state_lock:
+                errors.append(f"{key_name}:{LAST_NODE_LLM_ERROR or 'unknown'}")
+            continue
+
+        action, source = result
+        if action in TIMEOUT_ARMS:
+            with _state_lock:
+                LAST_NODE_LLM_KEY_SOURCE = key_name
+                LAST_NODE_LLM_ERROR = None
+            return action, source
+
+        errors.append(f"{key_name}:invalid_action:{action}")
+
+    with _state_lock:
+        LAST_NODE_LLM_ERROR = " | ".join(errors) if errors else "unknown_api_failure"
     return None
 
 
+def _available_keys() -> list[tuple[str, str, str]]:
+    """Return list of (key_name, provider, api_key) for keys that are present
+    and not currently rate-limited."""
+    now = time.time()
+    result = []
+    for key_name, provider in _KEY_ORDER:
+        api_key = os.environ.get(key_name, "").strip()
+        if not api_key:
+            continue
+        with _state_lock:
+            reset_at = _RATE_LIMITED_UNTIL.get(key_name, 0.0)
+        if reset_at > now:
+            continue
+        result.append((key_name, provider, api_key))
+    return result
+
+
+def _call_provider(
+    key_name: str,
+    provider: str,
+    api_key: str,
+    observation: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Call a single API key. Returns (raw_action_str, source_label) or None."""
+    if provider == "deepseek":
+        return _call_chat_completions(
+            key_name=key_name,
+            api_key=api_key,
+            endpoint=_DEEPSEEK_ENDPOINT,
+            model=_DEEPSEEK_MODEL,
+            source_label="deepseek",
+            observation=observation,
+            extra_headers=None,
+        )
+    elif provider == "groq":
+        return _call_chat_completions(
+            key_name=key_name,
+            api_key=api_key,
+            endpoint=_GROQ_ENDPOINT,
+            model=_GROQ_MODEL,
+            source_label="groq",
+            observation=observation,
+            extra_headers=None,
+        )
+    elif provider == "openrouter":
+        return _call_chat_completions(
+            key_name=key_name,
+            api_key=api_key,
+            endpoint=_OPENROUTER_ENDPOINT,
+            model=_OPENROUTER_MODEL,
+            source_label="openrouter",
+            observation=observation,
+            extra_headers={
+                "HTTP-Referer": "https://github.com/dwan-ith/RL-Raft",
+                "X-Title": "RL-Raft MARL Research",
+            },
+        )
+    return None
+
+
+def _call_chat_completions(
+    key_name: str,
+    api_key: str,
+    endpoint: str,
+    model: str,
+    source_label: str,
+    observation: dict[str, Any],
+    extra_headers: dict[str, str] | None,
+) -> tuple[str, str] | None:
+    """Generic OpenAI-compatible chat completions call."""
+    global LAST_NODE_LLM_ERROR
+    user_content = json.dumps(
+        {
+            "local_observation": observation,
+            "valid_actions": list(TIMEOUT_ARMS),
+            "schema": {"action": "one of valid_actions"},
+            "instruction": (
+                "Pick the action that best matches how this node should behave. "
+                "Return ONLY {\"action\": \"<chosen_action>\"}."
+            ),
+        },
+        indent=2,
+    )
+    body = {
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": 64,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RL-Raft-Client/1.0",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=4) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        text = _extract_chat_text(payload)
+        parsed = json.loads(_extract_json_object(text))
+        action = str(parsed.get("action", "")).strip()
+        return action, source_label
+
+    except urllib.error.HTTPError as exc:
+        body_text = _safe_error_body(exc)
+        if exc.code == 429:
+            # Parse Retry-After header if present
+            retry_after = _parse_retry_after(exc, body_text)
+            with _state_lock:
+                _RATE_LIMITED_UNTIL[key_name] = time.time() + retry_after
+                LAST_NODE_LLM_ERROR = f"rate_limited_retry_after_{retry_after}s"
+        elif exc.code in {401, 403}:
+            # Bad key — mark as permanently unavailable for this session
+            with _state_lock:
+                _RATE_LIMITED_UNTIL[key_name] = time.time() + 86400.0
+                LAST_NODE_LLM_ERROR = f"auth_error_{exc.code}"
+        else:
+            with _state_lock:
+                LAST_NODE_LLM_ERROR = f"http_{exc.code}:{body_text[:200]}"
+        return None
+
+    except Exception as exc:
+        with _state_lock:
+            # Back off this key for 30s to prevent repeated timeouts on every cache miss
+            _RATE_LIMITED_UNTIL[key_name] = time.time() + 30.0
+            LAST_NODE_LLM_ERROR = f"network_or_parse_error:{type(exc).__name__}:{exc}"
+        return None
+
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        with _state_lock:
+            LAST_NODE_LLM_ERROR = f"parse_error:{exc}"
+        return None
+
+
+def _parse_retry_after(exc: urllib.error.HTTPError, body_text: str) -> float:
+    """Extract retry-after seconds from headers or body. Default 60s."""
+    try:
+        header = exc.headers.get("Retry-After", "")
+        if header:
+            return max(5.0, float(header))
+    except (ValueError, AttributeError):
+        pass
+    # Try to find a number in the body like "retry after 30 seconds"
+    match = re.search(r"retry.{0,20}?(\d+)", body_text, re.IGNORECASE)
+    if match:
+        return max(5.0, float(match.group(1)))
+    return 60.0
+
+
+# ---------------------------------------------------------------------------
+# Deterministic fallback heuristic
+# ---------------------------------------------------------------------------
+
 def _fallback_action(observation: dict[str, Any]) -> str:
+    """Map local observation to a timeout arm without any API call.
+
+    Uses the same scoring formula as the observation_quality_score in sim.py
+    so the fallback is internally consistent with the reward signal.
+    """
     rtt = min(float(observation.get("mean_rtt_ms", observation.get("estimated_rtt_ms", 200.0))) / 350.0, 1.5)
     loss = min(float(observation.get("loss_rate", 0.0)) / 0.22, 1.5)
     log_gap = min(float(observation.get("log_gap", 0.0)) / 6.0, 1.0)
@@ -193,6 +430,10 @@ def _fallback_action(observation: dict[str, Any]) -> str:
     return "very_long"
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _observation_key(observation: dict[str, Any]) -> str:
     rtt = round(float(observation.get("mean_rtt_ms", observation.get("estimated_rtt_ms", 0.0))) / 25.0)
     loss = round(float(observation.get("loss_rate", 0.0)) / 0.025)
@@ -201,15 +442,18 @@ def _observation_key(observation: dict[str, Any]) -> str:
     return f"rtt={rtt};loss={loss};log={log_gap};split={int(split)}"
 
 
-def _extract_response_text(payload: dict[str, Any]) -> str:
-    if isinstance(payload.get("output_text"), str):
-        return payload["output_text"]
-    pieces: list[str] = []
-    for item in payload.get("output", []):
-        for content in item.get("content", []):
-            if isinstance(content, dict) and isinstance(content.get("text"), str):
-                pieces.append(content["text"])
-    return "\n".join(pieces)
+def _extract_chat_text(payload: dict[str, Any]) -> str:
+    """Extract content text from an OpenAI-compatible chat completions response."""
+    try:
+        choices = payload.get("choices", [])
+        if choices:
+            message = choices[0].get("message", {})
+            content = message.get("content", "")
+            if isinstance(content, str):
+                return content
+    except (KeyError, IndexError, TypeError):
+        pass
+    return str(payload)
 
 
 def _extract_json_object(text: str) -> str:
@@ -222,6 +466,6 @@ def _safe_error_body(exc: urllib.error.HTTPError) -> str:
         body = exc.read().decode("utf-8", errors="replace")
     except Exception:
         return "unreadable_error_body"
-    body = re.sub(r"sk-[A-Za-z0-9_-]+", "sk-REDACTED", body)
-    body = re.sub(r"Bearer\\s+[A-Za-z0-9._-]+", "Bearer REDACTED", body)
+    body = re.sub(r"sk-[A-Za-z0-9_\-]+", "sk-REDACTED", body)
+    body = re.sub(r"gsk_[A-Za-z0-9_\-]+", "gsk-REDACTED", body)
     return body[:500]

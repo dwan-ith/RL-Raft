@@ -12,6 +12,7 @@ from rlraft.core.supervisor import ClusterSupervisor
 from rlraft.rl.training import train_policy
 from rlraft.rl.mappo import train_mappo_policy
 from rlraft.rl.llm_node import check_llm_node_policy
+from rlraft.rl.logger import TrainingLogger
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--advisor", choices=["deterministic", "off"], default="off", help="legacy qlearning only; LLM reward shaping is disabled")
     train.add_argument("--advisor-interval", type=int, default=5000)
     train.add_argument("--require-llm", action="store_true", help="fail unless direct LLM-node policy can make a decision")
+    train.add_argument("--hidden-dim", type=int, default=128, help="actor-critic hidden layer size (128/256/512)")
 
     smoke = sub.add_parser("smoke", help="start a cluster briefly and print final metrics")
     smoke.add_argument("--nodes", type=int, default=50)
@@ -96,17 +98,34 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         if args.require_llm:
             llm_status = check_llm_node_policy()
-            if llm_status["source"] not in {"llm", "llm_cache"}:
+            if llm_status["source"] not in {"llm", "llm_cache", "groq", "openrouter", "deepseek"}:
                 print(json.dumps(llm_status, indent=2))
                 return 1
         if args.algorithm in {"llm_mappo", "mappo"}:
-            result = train_mappo_policy(
+            hidden_dim = getattr(args, "hidden_dim", 128)
+            logger = TrainingLogger(
                 episodes=args.episodes,
                 nodes=args.nodes,
-                output_path=args.output,
-                use_llm_prior=args.algorithm == "llm_mappo",
-                require_llm=args.require_llm,
+                algorithm=args.algorithm,
+                config={
+                    "hidden_dim": hidden_dim,
+                    "use_llm_prior": args.algorithm == "llm_mappo",
+                    "require_llm": args.require_llm,
+                    "output": args.output,
+                },
             )
+            try:
+                result = train_mappo_policy(
+                    episodes=args.episodes,
+                    nodes=args.nodes,
+                    output_path=args.output,
+                    use_llm_prior=args.algorithm == "llm_mappo",
+                    require_llm=args.require_llm,
+                    hidden_dim=hidden_dim,
+                    logger=logger,
+                )
+            finally:
+                logger.close()
         else:
             result = train_policy(
                 args.episodes,

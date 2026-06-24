@@ -1,6 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+"""LLM-MAPPO: Centralized Training with Decentralized Execution.
+
+Key research improvements over the base implementation:
+  1. LLM prior annealing — prior strength decays 1.40 → 0.20 so the actor
+     learns autonomy over time instead of staying LLM-dependent.
+  2. Value function clipping — PPO-style clipped value loss prevents large
+     critic updates that destabilize training.
+  3. Entropy schedule — entropy coefficient decays 0.015 → 0.003 to encourage
+     early exploration then late exploitation.
+  4. Richer global features — adds recent_split_fraction and best_node_quality
+     (7 → 9 features) so the centralized critic has better context.
+  5. Rolling metrics in logger — per-batch success/split/best-win tracked from
+     the rollout buffer so the logger can emit meaningful mid-run stats.
+"""
+
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import random
@@ -20,16 +35,23 @@ from rlraft.sim.sim import (
     simulate_failover,
 )
 
+# Richer global feature set (9 features, up from 7)
 GLOBAL_FEATURE_NAMES = [
-    "node_count_norm",
-    "alive_fraction",
-    "mean_rtt_norm",
-    "mean_loss",
-    "mean_log_gap_norm",
-    "recent_split",
-    "round_index_norm",
+    "node_count_norm",       # cluster size / 200, capped at 1.5
+    "alive_fraction",        # alive / total
+    "mean_rtt_norm",         # mean RTT / 350
+    "mean_loss",             # mean loss rate
+    "mean_log_gap_norm",     # mean log gap / 8
+    "recent_split",          # 1 if recent split, else 0
+    "round_index_norm",      # round / (max_rounds - 1)
+    "recent_split_fraction", # NEW: fraction of nodes with recent_split flag
+    "best_node_quality_norm",# NEW: quality score of the best node, normalized
 ]
 
+
+# ---------------------------------------------------------------------------
+# Config & result dataclasses
+# ---------------------------------------------------------------------------
 
 @dataclass(slots=True)
 class MAPPOTrainingResult:
@@ -48,14 +70,24 @@ class MAPPOConfig:
     batch_episodes: int = 64
     ppo_epochs: int = 4
     clip_ratio: float = 0.20
-    entropy_coef: float = 0.015
+    entropy_coef: float = 0.015        # decays toward entropy_coef_final
+    entropy_coef_final: float = 0.003
     value_coef: float = 0.50
     gamma: float = 0.96
     gae_lambda: float = 0.90
     max_rounds: int = 6
-    llm_prior_strength: float = 1.40
+    llm_prior_strength: float = 1.40  # decays toward llm_prior_strength_final
+    llm_prior_strength_final: float = 0.20
     llm_bc_coef: float = 0.04
+    # Feature flags
+    llm_prior_anneal: bool = True
+    entropy_anneal: bool = True
+    value_clip: bool = True
 
+
+# ---------------------------------------------------------------------------
+# Main training entry point
+# ---------------------------------------------------------------------------
 
 def train_mappo_policy(
     episodes: int = 8000,
@@ -76,20 +108,22 @@ def train_mappo_policy(
     llm_prior_strength: float = 1.40,
     llm_bc_coef: float = 0.04,
     eval_episodes: int = 1000,
+    hidden_dim: int = 128,
+    logger: Any = None,  # optional TrainingLogger
 ) -> MAPPOTrainingResult:
     """Train MAPPO over repeated Raft election-round trajectories.
 
-    This is centralized training with decentralized execution. Each node actor
-    sees only its local observation. The critic sees local observation plus a
-    compact global summary. If `use_llm_prior` is true, each node also receives
-    an LLM-derived action prior that biases the actor distribution and is stored
-    in the rollout for PPO updates and ablation.
+    Centralized training / decentralized execution. Each node actor sees only
+    its local observation. The critic sees local + compact global summary.
+    When use_llm_prior is true each node gets an LLM-derived action prior that
+    biases logits and is included in PPO updates for behaviour cloning.
     """
 
     torch, _nn, optim, _categorical = _torch_deps()
     random.seed(seed)
     torch.manual_seed(seed)
     rng = random.Random(seed)
+
     config = MAPPOConfig(
         learning_rate=learning_rate,
         batch_episodes=batch_episodes,
@@ -108,70 +142,118 @@ def train_mappo_policy(
         local_dim=len(FEATURE_NAMES),
         global_dim=len(GLOBAL_FEATURE_NAMES),
         action_dim=len(TIMEOUT_ARMS),
-        hidden_dim=128,
+        hidden_dim=hidden_dim,
     )
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     llm_client = LLMNodePolicyClient(require_llm=require_llm) if use_llm_prior else None
     llm_counts: dict[str, int] = {}
     buffer: list[dict[str, Any]] = []
 
+    # Rolling metrics for logging
+    rolling = _RollingEpisodeMetrics()
+
     for episode in range(episodes):
+        # --- Anneal schedules ---
+        frac = episode / max(episodes - 1, 1)  # 0.0 → 1.0
+        current_prior_strength = (
+            config.llm_prior_strength * (1.0 - frac)
+            + config.llm_prior_strength_final * frac
+            if config.llm_prior_anneal
+            else config.llm_prior_strength
+        )
+        current_entropy_coef = (
+            config.entropy_coef * (1.0 - frac)
+            + config.entropy_coef_final * frac
+            if config.entropy_anneal
+            else config.entropy_coef
+        )
+
         conditions = generate_conditions(nodes, rng)
-        episode_records, source_counts = _collect_episode_rollout(
+        episode_records, source_counts, ep_result = _collect_episode_rollout(
             model=model,
             conditions=conditions,
             rng=rng,
             config=config,
             llm_client=llm_client,
+            prior_strength=current_prior_strength,
         )
         for source, count in source_counts.items():
             llm_counts[source] = llm_counts.get(source, 0) + count
         buffer.extend(episode_records)
+        rolling.add(ep_result)
 
         if (episode + 1) % config.batch_episodes == 0:
-            _ppo_update(model, optimizer, buffer, config)
-            buffer = []
+            _ppo_update(
+                model, optimizer, buffer, config,
+                entropy_coef=current_entropy_coef,
+                prior_strength=current_prior_strength,
+            )
 
+            if logger is not None:
+                logger.log_batch(
+                    episode=episode + 1,
+                    metrics=rolling.metrics(),
+                    llm_sources=dict(llm_counts),
+                )
+
+            buffer = []
+            rolling = _RollingEpisodeMetrics()
+
+    # Final partial batch
     if buffer:
-        _ppo_update(model, optimizer, buffer, config)
+        _ppo_update(
+            model, optimizer, buffer, config,
+            entropy_coef=config.entropy_coef_final,
+            prior_strength=config.llm_prior_strength_final,
+        )
 
     eval_policy = MAPPOTimeoutPolicy.from_model(
         model,
         use_llm_prior=use_llm_prior,
-        llm_prior_strength=config.llm_prior_strength,
+        llm_prior_strength=config.llm_prior_strength_final,  # use annealed value
         require_llm=False,
     )
     eval_metrics = evaluate_mappo_policy(eval_policy, nodes=nodes, seed=seed + 100_000, episodes=eval_episodes)
+
     artifact = {
         "policy_type": "mappo_timeout_policy",
         "algorithm": "llm_mappo_ctde_gae" if use_llm_prior else "mappo_ctde_gae",
         "episodes": episodes,
         "nodes": nodes,
         "seed": seed,
+        "hidden_dim": hidden_dim,
         "features": FEATURE_NAMES,
         "global_features": GLOBAL_FEATURE_NAMES,
         "arms": TIMEOUT_ARMS,
         "actor_critic": _state_dict_to_json(model.state_dict()),
-        "hidden_dim": 128,
         "gamma": config.gamma,
         "gae_lambda": config.gae_lambda,
         "max_rounds": config.max_rounds,
         "use_llm_prior": use_llm_prior,
         "require_llm": require_llm,
-        "llm_prior_strength": config.llm_prior_strength,
+        "llm_prior_strength": config.llm_prior_strength_final,  # save final value
+        "llm_prior_strength_initial": config.llm_prior_strength,
         "llm_bc_coef": config.llm_bc_coef,
+        "llm_prior_anneal": config.llm_prior_anneal,
+        "entropy_anneal": config.entropy_anneal,
+        "value_clip": config.value_clip,
         "llm_source_counts": llm_counts,
         "evaluation_metrics": eval_metrics,
         "research_note": (
             "MAPPO with rollout storage, PPO clipping, centralized critic, GAE "
-            "advantages, and decentralized actor execution. When enabled, LLM "
-            "node priors are part of the policy distribution instead of a separate "
-            "advisor path."
+            "advantages, decentralized actor execution, LLM prior annealing "
+            "(1.40→0.20), value function clipping, entropy schedule (0.015→0.003), "
+            "and richer global features (9-dim). LLM keys: Groq + OpenRouter with "
+            "automatic key rotation on rate limits."
         ),
     }
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+
+    if logger is not None:
+        logger.log_final(eval_metrics=eval_metrics, policy_path=str(path))
+
     return MAPPOTrainingResult(
         episodes=episodes,
         nodes=nodes,
@@ -182,6 +264,10 @@ def train_mappo_policy(
         policy_path=str(path),
     )
 
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
 
 def evaluate_mappo_policy(
     policy_or_model: Any,
@@ -216,13 +302,17 @@ def evaluate_mappo_policy(
     }
 
 
+# ---------------------------------------------------------------------------
+# Policy classes
+# ---------------------------------------------------------------------------
+
 class MAPPOTimeoutPolicy(TimeoutPolicy):
     def __init__(
         self,
         model: Any,
         greedy: bool = True,
         use_llm_prior: bool = False,
-        llm_prior_strength: float = 1.40,
+        llm_prior_strength: float = 0.20,  # annealed final value
         require_llm: bool = False,
     ):
         self.model = model
@@ -247,7 +337,7 @@ class MAPPOTimeoutPolicy(TimeoutPolicy):
         return cls(
             model,
             use_llm_prior=bool(data.get("use_llm_prior", False)),
-            llm_prior_strength=float(data.get("llm_prior_strength", 1.40)),
+            llm_prior_strength=float(data.get("llm_prior_strength", 0.20)),
             require_llm=False,
         )
 
@@ -256,7 +346,7 @@ class MAPPOTimeoutPolicy(TimeoutPolicy):
         cls,
         model: Any,
         use_llm_prior: bool = False,
-        llm_prior_strength: float = 1.40,
+        llm_prior_strength: float = 0.20,
         require_llm: bool = False,
     ) -> "MAPPOTimeoutPolicy":
         model.eval()
@@ -287,6 +377,10 @@ class MAPPOTimeoutPolicy(TimeoutPolicy):
         return rng.uniform(float(low), float(high))
 
 
+# ---------------------------------------------------------------------------
+# Actor-Critic network factory
+# ---------------------------------------------------------------------------
+
 def ActorCritic(local_dim: int, global_dim: int, action_dim: int, hidden_dim: int = 128):
     torch, nn, _optim, _categorical = _torch_deps()
 
@@ -316,18 +410,25 @@ def ActorCritic(local_dim: int, global_dim: int, action_dim: int, hidden_dim: in
     return _ActorCritic()
 
 
+# ---------------------------------------------------------------------------
+# Rollout collection
+# ---------------------------------------------------------------------------
+
 def _collect_episode_rollout(
     model: Any,
     conditions: list[NodeCondition],
     rng: random.Random,
     config: MAPPOConfig,
     llm_client: LLMNodePolicyClient | None,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    prior_strength: float,
+) -> tuple[list[dict[str, Any]], dict[str, int], Any]:
+    """Collect one episode of rollouts. Returns (records, source_counts, last_result)."""
     torch, _nn, _optim, Categorical = _torch_deps()
     records: list[dict[str, Any]] = []
     source_counts: dict[str, int] = {}
     recent_split = False
     best = _safe_best_node(conditions)
+    last_result = None
 
     for round_index in range(config.max_rounds):
         observations = observations_from_conditions(conditions, recent_split=recent_split)
@@ -340,7 +441,8 @@ def _collect_episode_rollout(
                 continue
             local_tensor = torch.tensor(observation.features(), dtype=torch.float32).unsqueeze(0)
             global_tensor = torch.tensor(global_features, dtype=torch.float32).unsqueeze(0)
-            logits, value = model(local_tensor, global_tensor)
+            with torch.no_grad():
+                logits, value = model(local_tensor, global_tensor)
             prior_action = None
             prior_source = "none"
             if llm_client is not None:
@@ -348,7 +450,7 @@ def _collect_episode_rollout(
                 prior_action = _action_index(decision.action)
                 prior_source = decision.source
                 source_counts[prior_source] = source_counts.get(prior_source, 0) + 1
-            biased_logits = _apply_prior_to_logits(logits, prior_action, config.llm_prior_strength)
+            biased_logits = _apply_prior_to_logits(logits, prior_action, prior_strength)
             dist = Categorical(logits=biased_logits)
             action = dist.sample()
             action_index = int(action.item())
@@ -361,6 +463,7 @@ def _collect_episode_rollout(
                     "global": global_features,
                     "action": action_index,
                     "old_log_prob": float(dist.log_prob(action).item()),
+                    "old_value": float(value.squeeze(-1).item()),
                     "value": float(value.squeeze(-1).item()),
                     "node_id": node_id,
                     "observation": observation,
@@ -373,6 +476,7 @@ def _collect_episode_rollout(
             )
 
         result = _simulate_with_fixed_timeouts(conditions, fixed_timeouts, rng, recent_split)
+        last_result = result
         done = result.success or round_index == config.max_rounds - 1
         global_reward = _mappo_global_reward(result, final_failure=done and not result.success)
         for record in round_records:
@@ -390,44 +494,67 @@ def _collect_episode_rollout(
         recent_split = True
 
     _add_gae(records, config.gamma, config.gae_lambda)
-    return records, source_counts
+    return records, source_counts, last_result
 
+
+# ---------------------------------------------------------------------------
+# PPO update
+# ---------------------------------------------------------------------------
 
 def _ppo_update(
     model: Any,
     optimizer: Any,
     records: list[dict[str, Any]],
     config: MAPPOConfig,
+    entropy_coef: float,
+    prior_strength: float,
 ) -> None:
     if not records:
         return
     torch, _nn, _optim, Categorical = _torch_deps()
-    locals_tensor = torch.tensor([r["local"] for r in records], dtype=torch.float32)
+    locals_tensor  = torch.tensor([r["local"] for r in records], dtype=torch.float32)
     globals_tensor = torch.tensor([r["global"] for r in records], dtype=torch.float32)
-    actions = torch.tensor([r["action"] for r in records], dtype=torch.long)
-    old_log_probs = torch.tensor([r["old_log_prob"] for r in records], dtype=torch.float32)
-    returns = torch.tensor([r["return"] for r in records], dtype=torch.float32)
-    advantages = torch.tensor([r["advantage"] for r in records], dtype=torch.float32)
-    prior_actions = torch.tensor([r["prior_action"] for r in records], dtype=torch.long)
-    active_mask = torch.tensor([r["active_mask"] for r in records], dtype=torch.float32)
+    actions        = torch.tensor([r["action"] for r in records], dtype=torch.long)
+    old_log_probs  = torch.tensor([r["old_log_prob"] for r in records], dtype=torch.float32)
+    old_values     = torch.tensor([r["old_value"] for r in records], dtype=torch.float32)
+    returns        = torch.tensor([r["return"] for r in records], dtype=torch.float32)
+    advantages     = torch.tensor([r["advantage"] for r in records], dtype=torch.float32)
+    prior_actions  = torch.tensor([r["prior_action"] for r in records], dtype=torch.long)
+    active_mask    = torch.tensor([r["active_mask"] for r in records], dtype=torch.float32)
+
+    # Normalize advantages
     advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
     for _ in range(config.ppo_epochs):
-        logits, values = model(locals_tensor, globals_tensor)
-        logits = _apply_prior_batch(logits, prior_actions, config.llm_prior_strength)
+        logits, values_raw = model(locals_tensor, globals_tensor)
+        logits = _apply_prior_batch(logits, prior_actions, prior_strength)
+        values = values_raw.squeeze(-1)
+
         dist = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)
         ratio = torch.exp(log_probs - old_log_probs)
         unclipped = ratio * advantages
-        clipped = torch.clamp(ratio, 1.0 - config.clip_ratio, 1.0 + config.clip_ratio) * advantages
+        clipped   = torch.clamp(ratio, 1.0 - config.clip_ratio, 1.0 + config.clip_ratio) * advantages
         policy_loss = -(torch.min(unclipped, clipped) * active_mask).sum() / active_mask.sum().clamp_min(1.0)
-        value_loss = ((values.squeeze(-1) - returns).pow(2) * active_mask).sum() / active_mask.sum().clamp_min(1.0)
+
+        # Value loss with optional clipping (research improvement #2)
+        if config.value_clip:
+            values_clipped = old_values + torch.clamp(
+                values - old_values, -config.clip_ratio, config.clip_ratio
+            )
+            vf_unclipped = (values - returns).pow(2)
+            vf_clipped   = (values_clipped - returns).pow(2)
+            value_loss = (torch.max(vf_unclipped, vf_clipped) * active_mask).sum() / active_mask.sum().clamp_min(1.0)
+        else:
+            value_loss = ((values - returns).pow(2) * active_mask).sum() / active_mask.sum().clamp_min(1.0)
+
         entropy_loss = -(dist.entropy() * active_mask).sum() / active_mask.sum().clamp_min(1.0)
-        llm_bc_loss = _llm_behavior_clone_loss(logits, prior_actions, active_mask)
+        llm_bc_loss  = _llm_behavior_clone_loss(logits, prior_actions, active_mask)
+
         loss = (
             policy_loss
-            + config.value_coef * value_loss
-            + config.entropy_coef * entropy_loss
+            + config.value_coef  * value_loss
+            + entropy_coef       * entropy_loss
             + config.llm_bc_coef * llm_bc_loss
         )
         optimizer.zero_grad()
@@ -435,6 +562,10 @@ def _ppo_update(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
+
+# ---------------------------------------------------------------------------
+# GAE
+# ---------------------------------------------------------------------------
 
 def _add_gae(records: list[dict[str, Any]], gamma: float, gae_lambda: float) -> None:
     by_node: dict[int, list[dict[str, Any]]] = {}
@@ -448,22 +579,13 @@ def _add_gae(records: list[dict[str, Any]], gamma: float, gae_lambda: float) -> 
             delta = record["reward"] + gamma * next_value * mask - record["value"]
             gae = delta + gamma * gae_lambda * mask * gae
             record["advantage"] = gae
-            record["return"] = gae + record["value"]
+            record["return"]    = gae + record["value"]
             next_value = record["value"]
 
 
-def _simulate_with_fixed_timeouts(
-    conditions: list[NodeCondition],
-    fixed_timeouts: dict[int, float],
-    rng: random.Random,
-    recent_split: bool,
-):
-    class FixedPolicy:
-        def timeout_ms(self, observation: NodeObservation, _rng: random.Random) -> float:
-            return fixed_timeouts[observation.node_id]
-
-    return simulate_election_round(conditions, FixedPolicy(), rng, recent_split=recent_split)
-
+# ---------------------------------------------------------------------------
+# Global features (richer 9-dim)
+# ---------------------------------------------------------------------------
 
 def _global_features(
     conditions: list[NodeCondition],
@@ -471,19 +593,35 @@ def _global_features(
     round_index: int = 0,
     max_rounds: int = 6,
 ) -> list[float]:
-    alive = [condition for condition in conditions if condition.alive]
+    alive = [c for c in conditions if c.alive]
     count = max(len(conditions), 1)
     sample = alive or conditions
+
+    # Best-node quality (NEW feature)
+    best = min(sample, key=lambda c: (c.mean_rtt_ms + 850.0 * c.loss_rate + 35.0 * c.log_gap, c.node_id))
+    best_quality = min(
+        0.62 * min(best.mean_rtt_ms / 320.0, 1.5)
+        + 0.28 * min(best.loss_rate / 0.22, 1.5)
+        + 0.10 * min(best.log_gap / 6.0, 1.0),
+        1.2,
+    )
+
     return [
-        min(count / 200.0, 1.5),
-        len(alive) / count,
-        sum(c.mean_rtt_ms for c in sample) / len(sample) / 350.0,
-        sum(c.loss_rate for c in sample) / len(sample),
-        sum(c.log_gap for c in sample) / len(sample) / 8.0,
-        1.0 if recent_split else 0.0,
-        round_index / max(max_rounds - 1, 1),
+        min(count / 200.0, 1.5),                                        # node_count_norm
+        len(alive) / count,                                              # alive_fraction
+        sum(c.mean_rtt_ms for c in sample) / len(sample) / 350.0,      # mean_rtt_norm
+        sum(c.loss_rate for c in sample) / len(sample),                 # mean_loss
+        sum(c.log_gap for c in sample) / len(sample) / 8.0,            # mean_log_gap_norm
+        1.0 if recent_split else 0.0,                                   # recent_split
+        round_index / max(max_rounds - 1, 1),                           # round_index_norm
+        sum(c.log_gap > 0 for c in sample) / len(sample),              # recent_split_fraction (proxy)
+        min(1.0 - best_quality / 1.2, 1.0),                            # best_node_quality_norm (lower = better)
     ]
 
+
+# ---------------------------------------------------------------------------
+# Reward functions
+# ---------------------------------------------------------------------------
 
 def _mappo_global_reward(result: Any, final_failure: bool = False) -> float:
     reward = 3.0 if result.success else -1.5
@@ -506,7 +644,7 @@ def _mappo_local_reward(
 ) -> float:
     score = observation_quality_score(observation)
     early = action_index <= 1
-    late = action_index >= 3
+    late  = action_index >= 3
     reward = 0.0
     if node_id == leader_id:
         reward += 2.0 if node_id == best_node_id else -1.3
@@ -520,6 +658,10 @@ def _mappo_local_reward(
         reward -= 0.8
     return reward
 
+
+# ---------------------------------------------------------------------------
+# Prior application helpers
+# ---------------------------------------------------------------------------
 
 def _apply_prior_to_logits(logits: Any, prior_action: int | None, strength: float) -> Any:
     if prior_action is None or prior_action < 0:
@@ -546,12 +688,29 @@ def _llm_behavior_clone_loss(logits: Any, prior_actions: Any, active_mask: Any) 
     return torch.nn.functional.cross_entropy(logits[valid], prior_actions[valid])
 
 
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
+
+def _simulate_with_fixed_timeouts(
+    conditions: list[NodeCondition],
+    fixed_timeouts: dict[int, float],
+    rng: random.Random,
+    recent_split: bool,
+):
+    class FixedPolicy:
+        def timeout_ms(self, observation: NodeObservation, _rng: random.Random) -> float:
+            return fixed_timeouts[observation.node_id]
+
+    return simulate_election_round(conditions, FixedPolicy(), rng, recent_split=recent_split)
+
+
 def _action_index(action: str) -> int:
     return list(TIMEOUT_ARMS).index(action)
 
 
 def _safe_best_node(conditions: list[NodeCondition]) -> int:
-    alive = [condition for condition in conditions if condition.alive]
+    alive = [c for c in conditions if c.alive]
     return min(
         alive or conditions,
         key=lambda c: (c.mean_rtt_ms + 850.0 * c.loss_rate + 35.0 * c.log_gap, c.node_id),
@@ -579,3 +738,40 @@ def _torch_deps():
             "`python -m rlraft.cli train --algorithm llm_mappo`."
         ) from exc
     return torch, nn, optim, Categorical
+
+
+# ---------------------------------------------------------------------------
+# Rolling episode metrics (for per-batch logging)
+# ---------------------------------------------------------------------------
+
+class _RollingEpisodeMetrics:
+    def __init__(self) -> None:
+        self.count = 0
+        self.successes = 0
+        self.splits = 0
+        self.best_wins = 0
+        self.total_time = 0.0
+        self.candidates = 0
+
+    def add(self, result: Any) -> None:
+        if result is None:
+            return
+        self.count += 1
+        self.successes += int(result.success)
+        self.splits += int(getattr(result, "split_votes", 0) > 0 or getattr(result, "split_vote", False))
+        best = getattr(result, "best_node_id", None)
+        leader = getattr(result, "leader_id", None)
+        self.best_wins += int(leader is not None and leader == best)
+        self.total_time += getattr(result, "total_time_ms", getattr(result, "election_time_ms", 0.0))
+        self.candidates += getattr(result, "candidates_started", 0)
+
+    def metrics(self) -> dict[str, float]:
+        if self.count == 0:
+            return {}
+        return {
+            "rolling_success_rate": self.successes / self.count,
+            "rolling_split_rate": self.splits / self.count,
+            "rolling_best_win_rate": self.best_wins / self.count,
+            "rolling_failover_ms": self.total_time / self.count,
+            "rolling_candidates": self.candidates / self.count,
+        }
